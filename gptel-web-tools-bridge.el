@@ -116,6 +116,16 @@ override this with its own `:native-url-predicate'.  Set to `ignore'
 to always use the provider."
   :type 'function)
 
+(defcustom gptel-web-tools-bridge-connect-on-select t
+  "Whether enabling this bridge's tools should connect the provider.
+
+When non-nil, a watcher on `gptel-tools' starts the active provider's
+MCP server as soon as `web_search' or `web_fetch' is enabled, whether
+by the `gptel-tools' menu, a preset, or restored buffer state.  The
+handshake then runs while you type, so the first call reaches the
+provider instead of falling back to eww."
+  :type 'boolean)
+
 (defcustom gptel-web-tools-bridge-connect-on-demand t
   "Whether a call may start the provider's MCP server.
 
@@ -675,6 +685,51 @@ server was already connected."
       nil))))
 
 
+;;;; Connecting when the tools are enabled
+
+(defun gptel-web-tools-bridge--own-tool-p (tool)
+  "Return non-nil if TOOL is served by this bridge.
+Tests the function rather than the name, so that overridden
+gptel-agent tools count too."
+  (and (gptel-tool-p tool)
+       (memq (gptel-tool-function tool)
+             '(gptel-web-tools-bridge--search gptel-web-tools-bridge--fetch))))
+
+(defun gptel-web-tools-bridge--tools-watcher (_symbol newval operation _where)
+  "Connect the provider when NEWVAL enables one of this bridge's tools.
+
+Installed on `gptel-tools' with `add-variable-watcher'.  SYMBOL and
+WHERE are unused; the buffer a tool was enabled in does not matter,
+since MCP connections are global.
+
+Only the `set' OPERATION is acted on.  gptel does not let-bind
+`gptel-tools' today, but if it ever does, a binding and its unwinding
+must not each start a connection.  `kill-local-variable', which
+`gptel--set-with-scope' calls, reports itself as `makunbound' and is
+likewise ignored."
+  (when (and gptel-web-tools-bridge-connect-on-select
+             (eq operation 'set))
+    ;; A watcher runs as part of the assignment, so an error escaping
+    ;; here would make plain `setq gptel-tools' fail.  This deliberately
+    ;; catches errors even when `debug-on-error' is set, which rules out
+    ;; `with-demoted-errors': it re-signals while debugging, and breaking
+    ;; every write to `gptel-tools' is far worse than losing a backtrace.
+    (condition-case err
+        (when (seq-some #'gptel-web-tools-bridge--own-tool-p
+                        (ensure-list newval))
+          (gptel-web-tools-bridge-ensure-server))
+      (error (message "gptel-web-tools-bridge: connect-on-select failed: %s"
+                      (error-message-string err))))))
+
+(defun gptel-web-tools-bridge--install-tools-watcher ()
+  "Watch `gptel-tools' so enabling a web tool connects the provider.
+Idempotent: reloading this file does not stack watchers."
+  (remove-variable-watcher 'gptel-tools
+                           #'gptel-web-tools-bridge--tools-watcher)
+  (add-variable-watcher 'gptel-tools
+                        #'gptel-web-tools-bridge--tools-watcher))
+
+
 ;;;; Commands
 
 (defconst gptel-web-tools-bridge--no-bridge-label "no bridge (eww)"
@@ -753,6 +808,7 @@ Results, including their \"Source:\" lines, go to a display buffer."
 ;;;; Load-time setup
 
 (gptel-web-tools-bridge-register-tools)
+(gptel-web-tools-bridge--install-tools-watcher)
 
 (with-eval-after-load 'gptel-agent-tools
   (when gptel-web-tools-bridge-override-agent-tools
