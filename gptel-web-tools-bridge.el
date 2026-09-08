@@ -21,12 +21,18 @@
 ;;   searxng  an mcp-searxng instance (searxng_web_search, web_url_read)
 ;;   nil      no bridge; the Emacs web browser (eww) serves both tools
 ;;
-;; A call never fails outright.  When the provider is not connected,
-;; reports an error, times out, or returns something unparseable, the call
-;; falls back to the eww implementations in `gptel-agent-tools'.  Every
-;; result is prefixed with a single "Source:" line naming whatever
-;; actually served it, so a silent fallback is visible both in the chat
-;; buffer and to the model.
+;; A call never fails outright.  When the provider reports an error,
+;; times out, or returns something unparseable, the call falls back to the
+;; eww implementations in `gptel-agent-tools'.  Every result is prefixed
+;; with a single "Source:" line naming whatever actually served it, so a
+;; silent fallback is visible both in the chat buffer and to the model.
+;;
+;; Nothing here ever starts an MCP server.  Servers are yours to launch,
+;; with `M-x mcp-hub', `mcp-hub-start-all-server' from your init, or `M-x
+;; gptel-web-tools-bridge-ensure-server' to start just the active
+;; provider's.  A call made while the server is down is served by eww and
+;; says so on its "Source:" line, so the remedy is visible rather than
+;; guessed at.
 ;;
 ;; Adding a provider means adding an entry to
 ;; `gptel-web-tools-bridge-providers': a server name, two tool names, and
@@ -115,25 +121,6 @@ when the URL must be fetched locally instead.  A provider entry can
 override this with its own `:native-url-predicate'.  Set to `ignore'
 to always use the provider."
   :type 'function)
-
-(defcustom gptel-web-tools-bridge-connect-on-select t
-  "Whether enabling this bridge's tools should connect the provider.
-
-When non-nil, a watcher on `gptel-tools' starts the active provider's
-MCP server as soon as `web_search' or `web_fetch' is enabled, whether
-by the `gptel-tools' menu, a preset, or restored buffer state.  The
-handshake then runs while you type, so the first call reaches the
-provider instead of falling back to eww."
-  :type 'boolean)
-
-(defcustom gptel-web-tools-bridge-connect-on-demand t
-  "Whether a call may start the provider's MCP server.
-
-When non-nil and the server is not connected, the call is served
-natively and a connection attempt is started in the background, so
-that later calls reach the provider.  Attempts are throttled to one
-per minute."
-  :type 'boolean)
 
 (defcustom gptel-web-tools-bridge-override-agent-tools nil
   "Whether to point gptel-agent's own web tools at this bridge.
@@ -289,9 +276,6 @@ cannot work, and leaks an internal name on the way to failing."
 (defvar gptel-web-tools-bridge--last-warn 0.0
   "Time of the last fallback warning, for throttling.")
 
-(defvar gptel-web-tools-bridge--last-connect 0.0
-  "Time of the last on-demand connection attempt, for throttling.")
-
 (defun gptel-web-tools-bridge--provider ()
   "Return the plist for the active provider, or nil in native mode."
   (when gptel-web-tools-bridge-provider
@@ -312,6 +296,15 @@ cannot work, and leaks an internal name on the way to failing."
          (and connection
               (eq (mcp--status connection) 'connected)
               connection))))
+
+(defun gptel-web-tools-bridge--connecting-p (server)
+  "Return non-nil if SERVER's MCP handshake is in progress.
+mcp.el's connection status starts out as `init' and becomes
+`connected', `error' or `stop'; there is no `connecting'."
+  (and (featurep 'mcp)
+       (hash-table-p mcp-server-connections)
+       (let ((connection (gethash server mcp-server-connections)))
+         (and connection (eq (mcp--status connection) 'init)))))
 
 (defun gptel-web-tools-bridge--oneline (string &optional limit)
   "Collapse whitespace in STRING and truncate it to LIMIT characters."
@@ -363,15 +356,6 @@ but a list is accepted too."
                        (string-match-p "\\`[0-9]+\\'" (string-trim count)))
                   (string-to-number (string-trim count))))))
     (if (and n (> n 0)) n gptel-web-tools-bridge-default-results)))
-
-(defun gptel-web-tools-bridge--maybe-connect (server)
-  "Start SERVER in the background if allowed.
-Return non-nil if an attempt was made."
-  (when (and gptel-web-tools-bridge-connect-on-demand
-             (assoc server mcp-hub-servers)
-             (> (- (float-time) gptel-web-tools-bridge--last-connect) 60))
-    (gptel-web-tools-bridge-ensure-server)
-    t))
 
 (defun gptel-web-tools-bridge--call (label plist tool args callback fallback)
   "Call MCP TOOL with ARGS on the server described by PLIST.
@@ -427,8 +411,11 @@ with a note string when the provider cannot serve the call."
                      (lambda (code message)
                        (funcall bail (format "%s: %s" code message))))
                     nil)
-                (if (gptel-web-tools-bridge--maybe-connect server)
-                    "server not connected, connecting now"
+                ;; No server is started here; that is the user's call.  A
+                ;; handshake in progress is worth distinguishing from a
+                ;; server that is down, since retrying will fix the former.
+                (if (gptel-web-tools-bridge--connecting-p server)
+                    "server still connecting"
                   "server not connected"))
             (error (error-message-string err)))))
     (when reason (funcall bail reason))))
@@ -665,15 +652,19 @@ server was already connected."
       (message "gptel-web-tools-bridge: no server named %S in `mcp-hub-servers'"
                server)
       nil)
+     ((gptel-web-tools-bridge--connecting-p server)
+      ;; Status `init' means the handshake is under way.  Starting again
+      ;; would be a no-op anyway, since `mcp--server-running-p' counts
+      ;; anything but `stop' and `error' as running, and stopping it would
+      ;; abort a connection that is about to succeed.
+      (when interactive-p
+        (message "gptel-web-tools-bridge: %s is still connecting" server))
+      nil)
      (t
-      ;; A connection object left behind in any state other than
-      ;; `connecting' would make `mcp--server-running-p' report the server
-      ;; as running and `mcp-hub-start-all-server' skip it, so clear it out
-      ;; first.  A handshake in progress is left alone.
-      (let ((connection (gethash server mcp-server-connections)))
-        (when (and connection (not (eq (mcp--status connection) 'connecting)))
-          (ignore-errors (mcp-stop-server server))))
-      (setq gptel-web-tools-bridge--last-connect (float-time))
+      ;; Remaining states are `error', `stop', or no connection at all, all
+      ;; of which `mcp-hub-start-all-server' is willing to start.  Note that
+      ;; a connection whose status is still `connected' but whose session
+      ;; has expired cannot be detected here; use `mcp-hub' to restart it.
       (condition-case err
           (progn
             (when interactive-p
@@ -683,51 +674,6 @@ server was already connected."
          (message "gptel-web-tools-bridge: could not start %s: %s"
                   server (error-message-string err))))
       nil))))
-
-
-;;;; Connecting when the tools are enabled
-
-(defun gptel-web-tools-bridge--own-tool-p (tool)
-  "Return non-nil if TOOL is served by this bridge.
-Tests the function rather than the name, so that overridden
-gptel-agent tools count too."
-  (and (gptel-tool-p tool)
-       (memq (gptel-tool-function tool)
-             '(gptel-web-tools-bridge--search gptel-web-tools-bridge--fetch))))
-
-(defun gptel-web-tools-bridge--tools-watcher (_symbol newval operation _where)
-  "Connect the provider when NEWVAL enables one of this bridge's tools.
-
-Installed on `gptel-tools' with `add-variable-watcher'.  SYMBOL and
-WHERE are unused; the buffer a tool was enabled in does not matter,
-since MCP connections are global.
-
-Only the `set' OPERATION is acted on.  gptel does not let-bind
-`gptel-tools' today, but if it ever does, a binding and its unwinding
-must not each start a connection.  `kill-local-variable', which
-`gptel--set-with-scope' calls, reports itself as `makunbound' and is
-likewise ignored."
-  (when (and gptel-web-tools-bridge-connect-on-select
-             (eq operation 'set))
-    ;; A watcher runs as part of the assignment, so an error escaping
-    ;; here would make plain `setq gptel-tools' fail.  This deliberately
-    ;; catches errors even when `debug-on-error' is set, which rules out
-    ;; `with-demoted-errors': it re-signals while debugging, and breaking
-    ;; every write to `gptel-tools' is far worse than losing a backtrace.
-    (condition-case err
-        (when (seq-some #'gptel-web-tools-bridge--own-tool-p
-                        (ensure-list newval))
-          (gptel-web-tools-bridge-ensure-server))
-      (error (message "gptel-web-tools-bridge: connect-on-select failed: %s"
-                      (error-message-string err))))))
-
-(defun gptel-web-tools-bridge--install-tools-watcher ()
-  "Watch `gptel-tools' so enabling a web tool connects the provider.
-Idempotent: reloading this file does not stack watchers."
-  (remove-variable-watcher 'gptel-tools
-                           #'gptel-web-tools-bridge--tools-watcher)
-  (add-variable-watcher 'gptel-tools
-                        #'gptel-web-tools-bridge--tools-watcher))
 
 
 ;;;; Commands
@@ -755,25 +701,34 @@ Idempotent: reloading this file does not stack watchers."
   "Serve `web_search' and `web_fetch' from PROVIDER.
 
 PROVIDER is a key in `gptel-web-tools-bridge-providers', or nil to
-use eww directly.  The tools' descriptions are updated in place and
-the new provider's server is connected in the background.
+use eww directly.  The tools' descriptions are updated in place.  No
+server is started: the new provider's connection state is reported
+instead, so starting it stays a deliberate act.
 
 This changes the current session only; customize
 `gptel-web-tools-bridge-provider' to make it stick."
   (interactive (list (gptel-web-tools-bridge--read-provider)))
   (setq gptel-web-tools-bridge-provider provider)
   (gptel-web-tools-bridge--refresh-descriptions)
-  (let ((plist (gptel-web-tools-bridge--provider)))
+  (let* ((plist (gptel-web-tools-bridge--provider))
+         (server (plist-get plist :server)))
     (cond
      ((null provider)
       (message "gptel-web-tools-bridge: no bridge, web tools served by eww"))
      ((null plist)
       (message "gptel-web-tools-bridge: `%s' is not in `%s', falling back to eww"
                provider 'gptel-web-tools-bridge-providers))
-     (t
-      (gptel-web-tools-bridge-ensure-server)
+     ((gptel-web-tools-bridge--connection server)
       (message "gptel-web-tools-bridge: web tools served by %s"
-               (plist-get plist :label))))))
+               (plist-get plist :label)))
+     ((gptel-web-tools-bridge--connecting-p server)
+      (message "gptel-web-tools-bridge: %s selected, still connecting"
+               (plist-get plist :label)))
+     (t
+      (message (concat "gptel-web-tools-bridge: %s selected, but %s is not"
+                       " connected; start it with"
+                       " M-x gptel-web-tools-bridge-ensure-server")
+               (plist-get plist :label) server)))))
 
 ;;;###autoload
 (defun gptel-web-tools-bridge-test ()
@@ -808,7 +763,6 @@ Results, including their \"Source:\" lines, go to a display buffer."
 ;;;; Load-time setup
 
 (gptel-web-tools-bridge-register-tools)
-(gptel-web-tools-bridge--install-tools-watcher)
 
 (with-eval-after-load 'gptel-agent-tools
   (when gptel-web-tools-bridge-override-agent-tools
